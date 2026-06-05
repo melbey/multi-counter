@@ -1,58 +1,34 @@
 #!/usr/bin/env python3
 """
-Multi Counter Clicker - Streamlit + Google Apps Script backend
+Multi Counter Clicker - Instant browser UI + Google Apps Script sync
 
-This app stores counters in a Google Sheet through a Google Apps Script web app.
-No service account JSON key is required.
+This version avoids Streamlit reruns for +1/-1/reset/delete.
+Counting happens instantly in the browser, then syncs to Google Sheets in the background.
+
+Important:
+- This app embeds APPS_SCRIPT_URL and APPS_SCRIPT_TOKEN into the browser page so JavaScript can sync directly.
+- That means anyone who can open the public app can potentially inspect/use the token.
+- For a private counter tool this is usually acceptable, but do not use this pattern for sensitive data.
 """
 
 from __future__ import annotations
 
+import html
 import json
-import uuid
-from dataclasses import dataclass, asdict, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 APP_TITLE = "Multi Counter Clicker"
-APP_VERSION = "online-apps-script-v1"
+APP_VERSION = "instant-browser-v1"
 SWEDEN_TZ = ZoneInfo("Europe/Stockholm")
 
 
-def sweden_now() -> datetime:
-    return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).replace(tzinfo=None)
-
-
 def sweden_now_str() -> str:
-    return sweden_now().strftime("%Y-%m-%d %H:%M")
-
-
-@dataclass
-class Counter:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    name: str = "Counter"
-    count: int = 0
-    updated_at: str = ""
-
-    @staticmethod
-    def from_dict(data: Dict[str, Any]) -> "Counter":
-        raw = dict(data or {})
-        counter_id = str(raw.get("id") or str(uuid.uuid4()))
-        name = str(raw.get("name") or "Counter").strip() or "Counter"
-
-        try:
-            count = int(float(raw.get("count", 0) or 0))
-        except Exception:
-            count = 0
-
-        updated_at = str(raw.get("updated_at") or "")
-        return Counter(id=counter_id, name=name, count=count, updated_at=updated_at)
+    return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -62,85 +38,20 @@ def get_secret(name: str, default: str = "") -> str:
         return default
 
 
-def backend_url() -> str:
-    return get_secret("APPS_SCRIPT_URL", "").strip()
-
-
-def backend_token() -> str:
-    return get_secret("APPS_SCRIPT_TOKEN", "").strip()
-
-
-def api_call(action: str, counters: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    url = backend_url()
-    if not url:
-        raise RuntimeError("Missing APPS_SCRIPT_URL in Streamlit secrets.")
-
-    payload: Dict[str, Any] = {
-        "action": action,
-        "token": backend_token(),
-    }
-    if counters is not None:
-        payload["counters"] = counters
-
-    response = requests.post(url, json=payload, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error", "Unknown backend error."))
-
-    return data
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def load_counters_cached() -> List[Dict[str, Any]]:
-    return api_call("load").get("counters", [])
-
-
-def force_reload_counters() -> List[Counter]:
-    load_counters_cached.clear()
-    counters = [Counter.from_dict(item) for item in load_counters_cached()]
-    st.session_state["counters"] = counters
-    return counters
-
-
-def load_counters() -> List[Counter]:
-    if "counters" not in st.session_state:
-        st.session_state["counters"] = [Counter.from_dict(item) for item in load_counters_cached()]
-    return st.session_state["counters"]
-
-
-def save_counters(counters: List[Counter]) -> None:
-    for counter in counters:
-        counter.updated_at = sweden_now_str()
-    st.session_state["counters"] = counters
-    api_call("save", [asdict(c) for c in counters])
-    load_counters_cached.clear()
-
-
 def inject_css() -> None:
     st.markdown(
         """
         <style>
-        .stApp { transition: none !important; }
-        [data-testid="stStatusWidget"] { display: none !important; }
-        button, input, textarea, select, [role="button"], [data-testid="stDataFrame"] {
-            transition: none !important;
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 1rem;
+            max-width: 100%;
         }
-        .counter-card {
-            border: 1px solid rgba(120, 120, 120, 0.25);
-            border-radius: 0.75rem;
-            padding: 0.75rem 1rem;
-            margin-bottom: 0.75rem;
+        [data-testid="stStatusWidget"] {
+            display: none !important;
         }
-        .counter-count {
-            font-size: 2.2rem;
-            font-weight: 700;
-            line-height: 1.1;
-        }
-        .muted {
-            opacity: 0.7;
-            font-size: 0.85rem;
+        iframe {
+            border: 0 !important;
         }
         </style>
         """,
@@ -148,192 +59,542 @@ def inject_css() -> None:
     )
 
 
-def find_counter(counters: List[Counter], counter_id: str) -> Optional[Counter]:
-    for counter in counters:
-        if counter.id == counter_id:
-            return counter
-    return None
+def app_html(apps_script_url: str, apps_script_token: str) -> str:
+    # JSON-encode so values are safely inserted into JavaScript.
+    url_js = json.dumps(apps_script_url)
+    token_js = json.dumps(apps_script_token)
+    now_js = json.dumps(sweden_now_str())
 
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root {{
+  color-scheme: light dark;
+  --bg: #0e1117;
+  --panel: #161b22;
+  --panel2: #1f2630;
+  --text: #f0f3f6;
+  --muted: #9ca3af;
+  --border: rgba(255,255,255,.12);
+  --accent: #ff4b4b;
+  --good: #2ecc71;
+  --danger: #ef4444;
+  --button: #262d38;
+  --button-hover: #303847;
+}}
 
-def move_counter(counters: List[Counter], counter_id: str, direction: int) -> List[Counter]:
-    idx = next((i for i, c in enumerate(counters) if c.id == counter_id), None)
-    if idx is None:
-        return counters
+* {{
+  box-sizing: border-box;
+}}
 
-    new_idx = idx + direction
-    if new_idx < 0 or new_idx >= len(counters):
-        return counters
+html, body {{
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
 
-    counters[idx], counters[new_idx] = counters[new_idx], counters[idx]
-    return counters
+body {{
+  padding: 10px 12px 40px;
+}}
 
+.header {{
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}}
 
-def render_counter(counter: Counter, counters: List[Counter]) -> None:
-    with st.container(border=True):
-        col_name, col_count, col_minus, col_plus, col_reset, col_up, col_down, col_delete = st.columns(
-            [3.5, 1, 0.75, 0.75, 1, 0.65, 0.65, 0.85],
-            vertical_alignment="center",
-        )
+h1 {{
+  font-size: clamp(1.6rem, 4vw, 2.4rem);
+  margin: 0 0 .25rem;
+}}
 
-        new_name = col_name.text_input(
-            "Counter name",
-            value=counter.name,
-            key=f"name_{counter.id}",
-            label_visibility="collapsed",
-        )
+.subtitle {{
+  color: var(--muted);
+  font-size: .9rem;
+}}
 
-        if new_name.strip() and new_name.strip() != counter.name:
-            counter.name = new_name.strip()
-            save_counters(counters)
-            st.rerun()
+.toolbar {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+  justify-content: flex-end;
+}}
 
-        col_count.markdown(f"<div class='counter-count'>{counter.count}</div>", unsafe_allow_html=True)
+button {{
+  border: 1px solid var(--border);
+  background: var(--button);
+  color: var(--text);
+  padding: .55rem .75rem;
+  border-radius: .55rem;
+  cursor: pointer;
+  font-weight: 650;
+  min-height: 38px;
+}}
 
-        if col_minus.button("-1", key=f"minus_{counter.id}", use_container_width=True):
-            counter.count -= 1
-            save_counters(counters)
-            st.rerun()
+button:hover {{
+  background: var(--button-hover);
+}}
 
-        if col_plus.button("+1", key=f"plus_{counter.id}", use_container_width=True):
-            counter.count += 1
-            save_counters(counters)
-            st.rerun()
+button.primary {{
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}}
 
-        if col_reset.button("Reset", key=f"reset_{counter.id}", use_container_width=True):
-            counter.count = 0
-            save_counters(counters)
-            st.rerun()
+button.danger {{
+  color: #fecaca;
+}}
 
-        if col_up.button("↑", key=f"up_{counter.id}", use_container_width=True):
-            counters = move_counter(counters, counter.id, -1)
-            save_counters(counters)
-            st.rerun()
+.status {{
+  color: var(--muted);
+  font-size: .86rem;
+  min-height: 1.4rem;
+}}
 
-        if col_down.button("↓", key=f"down_{counter.id}", use_container_width=True):
-            counters = move_counter(counters, counter.id, 1)
-            save_counters(counters)
-            st.rerun()
+.add-panel {{
+  display: flex;
+  gap: .6rem;
+  margin: 1rem 0;
+  align-items: center;
+}}
 
-        if col_delete.button("Delete", key=f"delete_{counter.id}", use_container_width=True):
-            st.session_state[f"confirm_delete_{counter.id}"] = True
-            st.rerun()
+input {{
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: .55rem;
+  padding: .65rem .75rem;
+  font-size: 1rem;
+  min-height: 42px;
+}}
 
-        if st.session_state.get(f"confirm_delete_{counter.id}", False):
-            st.warning(f"Delete “{counter.name}”?")
-            confirm_col, cancel_col = st.columns(2)
-            if confirm_col.button("Yes, delete", key=f"confirm_yes_{counter.id}"):
-                save_counters([c for c in counters if c.id != counter.id])
-                st.session_state.pop(f"confirm_delete_{counter.id}", None)
-                st.rerun()
-            if cancel_col.button("Cancel", key=f"confirm_no_{counter.id}"):
-                st.session_state.pop(f"confirm_delete_{counter.id}", None)
-                st.rerun()
+.add-panel input {{
+  flex: 1;
+}}
 
+.counter-list {{
+  display: flex;
+  flex-direction: column;
+  gap: .65rem;
+}}
 
-def parse_imported_counters(data: Any) -> List[Counter]:
-    """
-    Accepts:
-    - Original local JSON: [ {"name": "...", "count": 0}, ... ]
-    - Online backup JSON: [ {"id": "...", "name": "...", "count": 0}, ... ]
-    - Wrapped format: {"counters": [...]}
-    """
-    if isinstance(data, dict):
-        if isinstance(data.get("counters"), list):
-            data = data["counters"]
-        else:
-            raise ValueError("JSON object found, but it does not contain a 'counters' list.")
+.counter {{
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 88px repeat(6, auto);
+  gap: .45rem;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: .8rem;
+  padding: .7rem;
+}}
 
-    if not isinstance(data, list):
-        raise ValueError("JSON must be a list of counters or an object containing a 'counters' list.")
+.counter-name {{
+  width: 100%;
+  font-weight: 650;
+}}
 
-    return [Counter.from_dict(item) for item in data]
+.count {{
+  text-align: center;
+  font-size: 2rem;
+  font-weight: 800;
+  line-height: 1;
+}}
+
+.small {{
+  padding: .45rem .55rem;
+  min-width: 52px;
+}}
+
+.empty {{
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: .8rem;
+  padding: 1rem;
+}}
+
+.footer {{
+  margin-top: 1rem;
+  color: var(--muted);
+  font-size: .85rem;
+}}
+
+@media (max-width: 850px) {{
+  .header {{
+    display: block;
+  }}
+
+  .toolbar {{
+    justify-content: flex-start;
+    margin-top: .75rem;
+  }}
+
+  .counter {{
+    grid-template-columns: 1fr 74px;
+  }}
+
+  .counter-name {{
+    grid-column: 1 / span 2;
+  }}
+
+  .count {{
+    text-align: left;
+    font-size: 2.4rem;
+    padding-left: .2rem;
+  }}
+
+  .counter button {{
+    min-height: 42px;
+  }}
+}}
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>Multi Counter Clicker</h1>
+      <div class="subtitle">{html.escape(APP_VERSION)} · Sweden time: <span id="swedenTime"></span></div>
+    </div>
+    <div class="toolbar">
+      <button id="reloadBtn">Reload</button>
+      <button id="saveBtn" class="primary">Save now</button>
+      <button id="exportBtn">Export JSON</button>
+      <button id="importBtn">Import JSON</button>
+      <input id="importFile" type="file" accept=".json,application/json" style="display:none" />
+    </div>
+  </div>
+
+  <div id="status" class="status">Starting...</div>
+
+  <div class="add-panel">
+    <input id="newCounterName" placeholder="New counter name, e.g. GFP-positive cells" />
+    <button id="addBtn" class="primary">Add counter</button>
+  </div>
+
+  <div id="counterList" class="counter-list"></div>
+
+  <div class="footer">
+    Counts update instantly in the browser. Changes are saved to Google Sheets automatically in the background.
+  </div>
+
+<script>
+const APPS_SCRIPT_URL = {url_js};
+const APPS_SCRIPT_TOKEN = {token_js};
+let counters = [];
+let saveTimer = null;
+let saving = false;
+let lastSavedJson = "";
+let dirty = false;
+
+function uuid() {{
+  if (crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "counter-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+}}
+
+function swedenTimestamp() {{
+  // Browser-local timestamp is only for display/update metadata.
+  // Google Sheet storage does not depend on this for counter math.
+  const d = new Date();
+  return d.toISOString();
+}}
+
+function setStatus(text, kind="") {{
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.style.color = kind === "error" ? "#f87171" : kind === "ok" ? "#86efac" : "var(--muted)";
+}}
+
+function normalizeCounter(item) {{
+  return {{
+    id: String(item.id || uuid()),
+    name: String(item.name || "Counter"),
+    count: Number(item.count || 0),
+    updated_at: String(item.updated_at || "")
+  }};
+}}
+
+async function api(action, payload={{}}) {{
+  const res = await fetch(APPS_SCRIPT_URL, {{
+    method: "POST",
+    headers: {{ "Content-Type": "text/plain;charset=utf-8" }},
+    body: JSON.stringify({{
+      action,
+      token: APPS_SCRIPT_TOKEN,
+      ...payload
+    }})
+  }});
+
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Unknown backend error");
+  return data;
+}}
+
+async function loadCounters() {{
+  try {{
+    setStatus("Loading from Google Sheets...");
+    const data = await api("load");
+    counters = (data.counters || []).map(normalizeCounter);
+    lastSavedJson = JSON.stringify(counters);
+    dirty = false;
+    render();
+    setStatus("Loaded. Ready.", "ok");
+  }} catch (err) {{
+    setStatus("Could not load: " + err.message, "error");
+    render();
+  }}
+}}
+
+async function saveCounters(force=false) {{
+  if (saving) return;
+  const currentJson = JSON.stringify(counters);
+
+  if (!force && currentJson === lastSavedJson) {{
+    dirty = false;
+    return;
+  }}
+
+  saving = true;
+  setStatus("Saving...");
+  try {{
+    const payloadCounters = counters.map(c => ({{
+      ...c,
+      updated_at: swedenTimestamp()
+    }}));
+    await api("save", {{ counters: payloadCounters }});
+    lastSavedJson = JSON.stringify(counters);
+    dirty = false;
+    setStatus("Saved.", "ok");
+  }} catch (err) {{
+    setStatus("Save failed: " + err.message, "error");
+  }} finally {{
+    saving = false;
+  }}
+}}
+
+function scheduleSave() {{
+  dirty = true;
+  setStatus("Changed locally. Saving soon...");
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveCounters(false), 450);
+}}
+
+function render() {{
+  const root = document.getElementById("counterList");
+  root.innerHTML = "";
+
+  if (counters.length === 0) {{
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No counters yet. Add one above.";
+    root.appendChild(empty);
+    return;
+  }}
+
+  counters.forEach((counter, index) => {{
+    const row = document.createElement("div");
+    row.className = "counter";
+
+    const name = document.createElement("input");
+    name.className = "counter-name";
+    name.value = counter.name;
+    name.title = "Rename counter";
+    name.addEventListener("input", () => {{
+      counter.name = name.value.trim() || "Counter";
+      scheduleSave();
+    }});
+
+    const count = document.createElement("div");
+    count.className = "count";
+    count.textContent = counter.count;
+
+    const minus = button("-1", "small", () => {{
+      counter.count -= 1;
+      count.textContent = counter.count;
+      scheduleSave();
+    }});
+
+    const plus = button("+1", "small primary", () => {{
+      counter.count += 1;
+      count.textContent = counter.count;
+      scheduleSave();
+    }});
+
+    const reset = button("Reset", "small", () => {{
+      if (confirm(`Reset “${{counter.name}}” to 0?`)) {{
+        counter.count = 0;
+        render();
+        scheduleSave();
+      }}
+    }});
+
+    const up = button("↑", "small", () => {{
+      if (index > 0) {{
+        [counters[index - 1], counters[index]] = [counters[index], counters[index - 1]];
+        render();
+        scheduleSave();
+      }}
+    }});
+
+    const down = button("↓", "small", () => {{
+      if (index < counters.length - 1) {{
+        [counters[index + 1], counters[index]] = [counters[index], counters[index + 1]];
+        render();
+        scheduleSave();
+      }}
+    }});
+
+    const del = button("Delete", "small danger", () => {{
+      if (confirm(`Delete “${{counter.name}}”?`)) {{
+        counters = counters.filter(c => c.id !== counter.id);
+        render();
+        scheduleSave();
+      }}
+    }});
+
+    row.appendChild(name);
+    row.appendChild(count);
+    row.appendChild(minus);
+    row.appendChild(plus);
+    row.appendChild(reset);
+    row.appendChild(up);
+    row.appendChild(down);
+    row.appendChild(del);
+    root.appendChild(row);
+  }});
+}}
+
+function button(text, cls, onClick) {{
+  const b = document.createElement("button");
+  b.textContent = text;
+  b.className = cls || "";
+  b.addEventListener("click", onClick);
+  return b;
+}}
+
+function addCounter() {{
+  const input = document.getElementById("newCounterName");
+  const name = input.value.trim();
+  if (!name) {{
+    input.focus();
+    return;
+  }}
+  counters.push({{
+    id: uuid(),
+    name,
+    count: 0,
+    updated_at: swedenTimestamp()
+  }});
+  input.value = "";
+  render();
+  scheduleSave();
+}}
+
+function exportJson() {{
+  const blob = new Blob([JSON.stringify(counters, null, 2)], {{ type: "application/json" }});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "multi_counter_backup.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}}
+
+function importJsonFile(file) {{
+  const reader = new FileReader();
+  reader.onload = () => {{
+    try {{
+      let data = JSON.parse(reader.result);
+      if (data && !Array.isArray(data) && Array.isArray(data.counters)) data = data.counters;
+      if (!Array.isArray(data)) throw new Error("JSON must be a list of counters or an object with a counters list.");
+      const imported = data.map(normalizeCounter);
+      if (confirm(`Replace current counters with ${{imported.length}} imported counter(s)?`)) {{
+        counters = imported;
+        render();
+        scheduleSave();
+      }}
+    }} catch (err) {{
+      alert("Import failed: " + err.message);
+    }}
+  }};
+  reader.readAsText(file);
+}}
+
+document.getElementById("addBtn").addEventListener("click", addCounter);
+document.getElementById("newCounterName").addEventListener("keydown", (e) => {{
+  if (e.key === "Enter") addCounter();
+}});
+document.getElementById("reloadBtn").addEventListener("click", () => {{
+  if (dirty && !confirm("You have unsaved local changes. Reload anyway?")) return;
+  loadCounters();
+}});
+document.getElementById("saveBtn").addEventListener("click", () => saveCounters(true));
+document.getElementById("exportBtn").addEventListener("click", exportJson);
+document.getElementById("importBtn").addEventListener("click", () => document.getElementById("importFile").click());
+document.getElementById("importFile").addEventListener("change", (e) => {{
+  if (e.target.files && e.target.files[0]) importJsonFile(e.target.files[0]);
+  e.target.value = "";
+}});
+
+window.addEventListener("beforeunload", (e) => {{
+  if (dirty) {{
+    saveCounters(true);
+  }}
+}});
+
+function updateSwedenClock() {{
+  const formatter = new Intl.DateTimeFormat("sv-SE", {{
+    timeZone: "Europe/Stockholm",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }});
+  document.getElementById("swedenTime").textContent = formatter.format(new Date());
+}}
+
+setInterval(updateSwedenClock, 15000);
+updateSwedenClock();
+loadCounters();
+</script>
+</body>
+</html>
+"""
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     inject_css()
 
-    st.title(APP_TITLE)
-    st.caption(f"{APP_VERSION} · Sweden time: {sweden_now_str()}")
+    apps_script_url = get_secret("APPS_SCRIPT_URL", "").strip()
+    apps_script_token = get_secret("APPS_SCRIPT_TOKEN", "").strip()
 
-    try:
-        counters = load_counters()
-    except Exception as exc:
-        st.error(f"Could not load data from Google Sheets backend: {exc}")
+    if not apps_script_url:
+        st.error("Missing APPS_SCRIPT_URL in Streamlit secrets.")
         st.stop()
 
-    with st.sidebar:
-        st.header("Google Sheets")
-        st.write("Counters are saved to the Google Sheet configured in Streamlit secrets.")
+    if not apps_script_token:
+        st.error("Missing APPS_SCRIPT_TOKEN in Streamlit secrets.")
+        st.stop()
 
-        if st.button("Reload from Google Sheet", use_container_width=True):
-            force_reload_counters()
-            st.rerun()
-
-        st.divider()
-        st.header("Import / export")
-
-        st.download_button(
-            "Download JSON backup",
-            data=json.dumps([asdict(c) for c in counters], indent=2),
-            file_name="multi_counter_backup.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        uploaded = st.file_uploader("Import JSON backup", type=["json"])
-        if uploaded is not None:
-            try:
-                data = json.loads(uploaded.read().decode("utf-8"))
-                imported = parse_imported_counters(data)
-                st.success(f"Ready to import {len(imported)} counter(s).")
-
-                if st.button("Replace Google Sheet counters", use_container_width=True):
-                    save_counters(imported)
-                    st.success("Imported.")
-                    st.rerun()
-            except Exception as exc:
-                st.error(f"Could not import JSON: {exc}")
-
-        st.divider()
-        st.header("Danger zone")
-        if st.button("Delete all counters", use_container_width=True):
-            st.session_state["confirm_delete_all"] = True
-
-        if st.session_state.get("confirm_delete_all", False):
-            st.warning("Delete all counters?")
-            if st.button("Yes, delete all", use_container_width=True):
-                save_counters([])
-                st.session_state["confirm_delete_all"] = False
-                st.rerun()
-            if st.button("Cancel", use_container_width=True):
-                st.session_state["confirm_delete_all"] = False
-                st.rerun()
-
-    with st.form("add_counter_form"):
-        st.subheader("Add counter")
-        new_name = st.text_input("New counter name", placeholder="e.g. GFP-positive cells")
-        submitted = st.form_submit_button("Add New Counter")
-
-    if submitted:
-        name = new_name.strip()
-        if not name:
-            st.error("Please enter a counter name.")
-        else:
-            counters.append(Counter(name=name, count=0, updated_at=sweden_now_str()))
-            save_counters(counters)
-            st.rerun()
-
-    st.header("Counters")
-
-    if not counters:
-        st.info("No counters yet. Add one above.")
-    else:
-        for counter in counters:
-            render_counter(counter, counters)
-
-    with st.expander("Raw data"):
-        st.dataframe(pd.DataFrame([asdict(c) for c in counters]), use_container_width=True, hide_index=True)
+    components.html(
+        app_html(apps_script_url, apps_script_token),
+        height=900,
+        scrolling=True,
+    )
 
 
 if __name__ == "__main__":
